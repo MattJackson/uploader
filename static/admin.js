@@ -77,16 +77,20 @@ if (arriving) {
 				parts.push('measuring…')
 			}
 			if (p.ip) parts.push(p.ip)
-			if (p.client) parts.push(p.client)
 			parts.push('started ' + ago(p.age))
-			if (p.resumes) parts.push('resumed ' + p.resumes + '×')
-			const detail = el('span', 'detail')
-			if (p.ua) detail.title = p.ua
-			parts.forEach((x, i) => {
-				if (i) detail.append(' · ')
-				detail.append(x)
-			})
-			name.append(detail)
+			// One line each: progress and origin, browser, resumes.
+			const lines = [parts]
+			if (p.client) lines.push([p.client])
+			if (p.resumes) lines.push(['resumed ' + p.resumes + '×'])
+			for (const items of lines) {
+				const line = el('span', 'detail')
+				if (p.ua && items[0] === p.client) line.title = p.ua
+				items.forEach((x, i) => {
+					if (i) line.append(' · ')
+					line.append(typeof x === 'string' ? el('span', 'part', x) : x)
+				})
+				name.append(line)
+			}
 		}
 		const act = el('td', 'actions')
 		act.append(bar)

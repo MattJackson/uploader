@@ -51,6 +51,7 @@ td.actions > * { margin-left: 6px; }
 td.actions form { display: inline; }
 .empty { color: var(--muted); text-align: center; padding: 24px 0; }
 td .detail { display: block; margin-top: 2px; color: var(--muted); font-size: 13px; font-weight: 400; word-break: normal; }
+td .detail .part, td .detail .stalled { white-space: nowrap; } /* wrap only between items */
 td .detail .stalled { color: var(--danger); }
 progress { width: 120px; height: 8px; vertical-align: middle; accent-color: var(--accent); }
 .file-icon { font-size: 44px; line-height: 1; margin-bottom: 14px; }
