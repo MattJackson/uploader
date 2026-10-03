@@ -1,0 +1,15 @@
+{{template "head" "Admin · upload"}}
+<body>
+<main class="narrow">
+	<div class="card">
+		<h1>Admin</h1>
+		<p class="sub">Sign in to see uploaded files.</p>
+		{{if .Failed}}<p class="err">Wrong password.</p>{{end}}
+		<form method="post" action="/admin/login">
+			<input type="password" name="password" placeholder="Password" autofocus autocomplete="current-password">
+			<button class="primary full">Sign in</button>
+		</form>
+	</div>
+</main>
+</body>
+</html>

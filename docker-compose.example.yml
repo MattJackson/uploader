@@ -1,0 +1,26 @@
+# Minimal deployment. Put a TLS-terminating reverse proxy (Caddy, Traefik,
+# nginx) in front of port 8080 — the admin cookie is Secure-only.
+services:
+  uploader:
+    image: ghcr.io/mattjackson/uploader:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      UPLOAD_SECRET: change-me-to-a-long-random-string   # openssl rand -hex 32
+      # Optional first-run defaults; edit them later at /admin/settings.
+      OWNER_NAME: ""
+      PUBLIC_URL: "https://upload.example.com"
+      # SMTP_HOST: smtp.example.com
+      # SMTP_PORT: "587"
+      # SMTP_SECURITY: starttls     # starttls | tls | none
+      # SMTP_USER: ""
+      # SMTP_PASS: ""
+      # MAIL_FROM: uploader@example.com
+      # NOTIFY_TO: you@example.com
+    volumes:
+      - data:/data     # finished files (can be a network share)
+      - spool:/spool   # uploads in progress + settings (keep on local disk)
+volumes:
+  data:
+  spool:

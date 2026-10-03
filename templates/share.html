@@ -1,0 +1,12 @@
+{{template "head" .Name}}
+<body>
+<main class="narrow share">
+	<div class="card">
+		<div class="file-icon">📦</div>
+		<h1>{{.Name}}</h1>
+		<p class="sub">{{size .Size}}{{with .Owner}} · shared by {{.}}{{end}}</p>
+		<a class="btn primary big" href="{{.Link}}">Download</a>
+	</div>
+</main>
+</body>
+</html>

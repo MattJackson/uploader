@@ -1,0 +1,40 @@
+{{template "head" "Files · upload"}}
+<body data-admin="1">
+<main>
+	<div class="top">
+		<h1>Files</h1>
+		<div class="links"><a class="link" href="/admin/settings">Settings</a><a class="link" href="/admin/password">Change password</a><form method="post" action="/admin/logout"><button class="link">Sign out</button></form></div>
+	</div>
+	<p class="sub">Upload here to get a shareable link, or grab what's been sent to you.</p>
+	<div id="drop"></div>
+
+	{{if .Partials}}
+	<h2>Arriving</h2>
+	<div class="card"><table>
+	{{range .Partials}}
+		<tr><td class="name">{{.Name}}</td><td class="meta">{{if .Saving}}{{size .Size}} · saving to NAS…{{else}}{{size .Received}} / {{size .Size}}{{end}}</td><td class="actions"><progress max="100" value="{{.Percent}}"></progress></td></tr>
+	{{end}}
+	</table></div>
+	{{end}}
+
+	<h2>Received</h2>
+	<div class="card"><table>
+	{{range .Files}}
+		<tr>
+			<td class="name">{{.Name}}</td>
+			<td class="meta">{{size .Size}} · {{.Mod.Format "Jan 2, 15:04"}}</td>
+			<td class="actions">
+				<button data-link="{{.Link}}">Copy link</button>
+				<a class="btn primary" href="{{.Download}}">Download</a>
+				<form method="post" action="/admin/delete" data-confirm="Delete {{.Name}}?"><input type="hidden" name="name" value="{{.Name}}"><button class="danger">Delete</button></form>
+			</td>
+		</tr>
+	{{else}}
+		<tr><td class="empty">Nothing yet.</td></tr>
+	{{end}}
+	</table></div>
+</main>
+<script type="module" src="/static/upload.js"></script>
+<script src="/static/admin.js"></script>
+</body>
+</html>

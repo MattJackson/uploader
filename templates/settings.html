@@ -1,0 +1,45 @@
+{{template "head" "Settings · uploader"}}
+<body>
+<main class="narrow-wide">
+	<div class="top">
+		<h1>Settings</h1>
+		<a class="link" href="/admin">Back to files</a>
+	</div>
+	{{if .Saved}}<p class="ok">Saved.</p>{{end}}
+	{{with .Error}}<p class="err">{{.}}</p>{{end}}
+	{{with .Test}}<p class="{{if $.TestOK}}ok{{else}}err{{end}}">{{.}}</p>{{end}}
+	<form method="post" action="/admin/settings" class="card stack">
+		<h2>General</h2>
+		<label>Your name <span class="hint">shown as "Send files to …" and "shared by …"; leave empty for neutral wording</span>
+			<input name="owner_name" value="{{.S.OwnerName}}" maxlength="60"></label>
+		<label>Site URL <span class="hint">e.g. https://upload.example.com, used for links in emails</span>
+			<input name="public_url" value="{{.S.PublicURL}}" placeholder="https://"></label>
+
+		<h2>Email notifications</h2>
+		<label>Notify this address when files arrive <span class="hint">empty = off; uploads arriving close together are sent as one email</span>
+			<input name="notify_to" type="email" value="{{.S.NotifyTo}}"></label>
+		<label>From address <span class="hint">a sender your mail server accepts</span>
+			<input name="mail_from" type="email" value="{{.S.MailFrom}}"></label>
+		<div class="row">
+			<label class="grow">Mail server (SMTP) host
+				<input name="smtp_host" value="{{.S.SMTPHost}}" placeholder="smtp.example.com"></label>
+			<label>Port
+				<input name="smtp_port" type="number" min="1" max="65535" value="{{.S.SMTPPort}}"></label>
+			<label>Security
+				<select name="smtp_security">{{range .Modes}}<option value="{{.}}"{{if eq . $.S.SMTPSecurity}} selected{{end}}>{{.}}</option>{{end}}</select></label>
+		</div>
+		<div class="row">
+			<label class="grow">Username <span class="hint">empty = no login</span>
+				<input name="smtp_user" value="{{.S.SMTPUser}}" autocomplete="off"></label>
+			<label class="grow">Password
+				<input name="smtp_pass" type="password" placeholder="{{if .HasPass}}unchanged{{end}}" autocomplete="new-password"></label>
+		</div>
+		{{if .HasPass}}<label class="check"><input type="checkbox" name="clear_pass" value="1"> Remove saved password</label>{{end}}
+		<button class="primary full">Save settings</button>
+	</form>
+	<form method="post" action="/admin/settings/test" class="test">
+		<button {{if not .Notifies}}disabled title="Save a notification address, From address and mail server first"{{end}}>Send test email</button>
+	</form>
+</main>
+</body>
+</html>
