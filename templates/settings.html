@@ -18,6 +18,9 @@
 		<h2>Email notifications</h2>
 		<label>Notify this address when files arrive <span class="hint">empty = off; uploads arriving close together are sent as one email</span>
 			<input name="notify_to" type="email" value="{{.S.NotifyTo}}"></label>
+		<input type="hidden" name="notify_flags" value="1">
+		<label class="check"><input type="checkbox" name="notify_start" value="1"{{if not .S.MuteStart}} checked{{end}}> When an upload starts <span class="hint">skipped for uploads that finish within 30 seconds</span></label>
+		<label class="check"><input type="checkbox" name="notify_done" value="1"{{if not .S.MuteDone}} checked{{end}}> When an upload is received</label>
 		<label>From address <span class="hint">a sender your mail server accepts</span>
 			<input name="mail_from" type="email" value="{{.S.MailFrom}}"></label>
 		<div class="row">

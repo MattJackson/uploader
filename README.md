@@ -6,9 +6,9 @@ Built for the "my parents need to send me 40 GB of home videos" problem.
 
 - **Any size, resumable.** Uploads are chunked ([tus](https://tus.io)). If the connection drops, adding the same file again continues where it stopped.
 - **Upload-only for visitors.** Anonymous users can create and resume uploads. They can't list, read or delete anything.
-- **Admin page** at `/admin`: upload, list, download, delete, and copy share links.
+- **Admin page** at `/admin`: upload, list, download, delete, and copy share links. Uploads in progress update live, with speed, time left, the sender's IP and browser, when they started, how often they resumed, and a warning when one stalls.
 - **Share links** go to a small landing page with a Download button, so chat-app previews don't pull the whole file. A link is tied to the exact file: deleting, replacing or editing the file revokes it.
-- **Email notifications** (optional). Uploads that arrive close together are sent as one email.
+- **Email notifications** (optional) when an upload starts and when it's received, each switchable in Settings. Uploads close together are sent as one email; a "started" email is skipped for uploads that finish within 30 seconds.
 - **Disk safety.** New uploads are refused if they would cut into a free-space reserve, counting space already promised to unfinished uploads. Writes also stop if the local disk runs low.
 - **Network-share friendly.** In-progress uploads stay on local disk. Finished files are then copied to `/data`, which can be an NFS or SMB share.
 - One static Go binary in a distroless image, with no database.

@@ -21,9 +21,11 @@ package main
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"embed"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +33,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -144,7 +147,7 @@ func main() {
 
 	go sweepPartials()
 	go mover()
-	go notifier()
+	go notifier(startCh, notifyCh)
 	go func() {
 		for {
 			refreshNASFree()
@@ -173,8 +176,8 @@ func newMux() (*http.ServeMux, error) {
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/files/", guardSpool(http.StripPrefix("/files/", tus)))
-	mux.Handle("/files", guardSpool(http.StripPrefix("/files", tus)))
+	mux.Handle("/files/", guardSpool(http.StripPrefix("/files/", watch(tus))))
+	mux.Handle("/files", guardSpool(http.StripPrefix("/files", watch(tus))))
 	mux.Handle("GET /static/", http.FileServerFS(staticFS))
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		render(w, "index.html", map[string]any{"Owner": currentSettings().OwnerName})
@@ -184,6 +187,7 @@ func newMux() (*http.ServeMux, error) {
 	mux.HandleFunc("POST /admin/logout", sameOrigin(logout))
 	mux.HandleFunc("GET /admin/password", signedIn(passwordPage))
 	mux.HandleFunc("POST /admin/password", sameOrigin(signedIn(changePassword)))
+	mux.HandleFunc("GET /admin/arriving", authed(arriving))
 	mux.HandleFunc("GET /admin/dl/{name}", authed(adminDownload))
 	mux.HandleFunc("POST /admin/delete", sameOrigin(authed(deleteFile)))
 	mux.HandleFunc("GET /admin/settings", authed(settingsPage))
@@ -254,7 +258,91 @@ func checkSpace(ev handler.HookEvent) (handler.HTTPResponse, handler.FileInfoCha
 		return none(noSpace)
 	}
 	admitted = append(admitted, admission{size, time.Now()})
-	return none(nil)
+	// Stamp who sent it into the .info, so the admin list still knows after
+	// a restart. Server-set keys win over anything the client sent.
+	meta := make(handler.MetaData, len(ev.Upload.MetaData)+2)
+	for k, v := range ev.Upload.MetaData {
+		meta[k] = v
+	}
+	meta[metaIP] = clientIP(ev.HTTPRequest.Header, ev.HTTPRequest.RemoteAddr)
+	meta[metaUA] = clip(ev.HTTPRequest.Header.Get("User-Agent"), 512)
+	// Pick the id ourselves so the "started" email can tell later whether
+	// this upload is still going. Same shape as filestore's own ids.
+	id := make([]byte, 16)
+	if _, err := rand.Read(id); err != nil {
+		return none(err)
+	}
+	changes := handler.FileInfoChanges{ID: hex.EncodeToString(id), MetaData: meta}
+	notifyStart(changes.ID, cleanName(meta["filename"]), size, sender(meta[metaIP], meta[metaUA]))
+	return handler.HTTPResponse{}, changes, nil
+}
+
+const (
+	metaIP = "uploader.ip"
+	metaUA = "uploader.ua"
+)
+
+func clip(s string, n int) string {
+	if len(s) > n {
+		s = s[:n]
+	}
+	return strings.ToValidUTF8(s, "")
+}
+
+// seen is what the tus endpoint has observed per upload since we started:
+// the latest client address and how many times it resumed (a HEAD on an
+// existing upload is a client asking where to carry on from). Memory only.
+var seen = struct {
+	sync.Mutex
+	m map[string]*sighting
+}{m: map[string]*sighting{}}
+
+type sighting struct {
+	ip, ua  string
+	resumes int
+}
+
+// watch records sightings for the admin list. It only reads the request and
+// never touches the response, so it can't get in the way of an upload.
+func watch(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead || r.Method == http.MethodPatch {
+			note(strings.Trim(r.URL.Path, "/"), r)
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+func note(id string, r *http.Request) {
+	// Only real uploads: the map can't be grown by requests for made-up ids.
+	if !uploadID(id) || !fileExists(filepath.Join(partDir, id+".info")) {
+		return
+	}
+	seen.Lock()
+	defer seen.Unlock()
+	s := seen.m[id]
+	if s == nil {
+		s = &sighting{}
+		seen.m[id] = s
+	}
+	s.ip = clientIP(r.Header, r.RemoteAddr)
+	s.ua = clip(r.Header.Get("User-Agent"), 512)
+	if r.Method == http.MethodHead {
+		s.resumes++
+	}
+}
+
+// uploadID matches the ids filestore hands out: 32 hex digits.
+func uploadID(id string) bool {
+	if len(id) != 32 {
+		return false
+	}
+	for _, c := range id {
+		if !strings.ContainsRune("0123456789abcdef", c) {
+			return false
+		}
+	}
+	return true
 }
 
 // committed returns bytes promised but not yet on each disk. Caller holds
@@ -371,8 +459,14 @@ func finish(ev handler.HookEvent) (handler.HTTPResponse, error) {
 		log.Printf("finish %s: %v", id, err)
 		return handler.HTTPResponse{}, err
 	}
-	log.Printf("received %q (%s) from %s", name, humanSize(ev.Upload.Size), clientIP(ev.HTTPRequest.Header, ev.HTTPRequest.RemoteAddr))
-	notifyUpload(name, ev.Upload.Size)
+	// Re-checked: an upload created by an older version may carry a
+	// client-supplied value under this key.
+	ip, ua := cleanIP(ev.Upload.MetaData[metaIP]), clip(ev.Upload.MetaData[metaUA], 512)
+	if ip == "" { // created before we stamped uploads
+		ip, ua = clientIP(ev.HTTPRequest.Header, ev.HTTPRequest.RemoteAddr), ev.HTTPRequest.Header.Get("User-Agent")
+	}
+	log.Printf("received %q (%s) from %s", name, humanSize(ev.Upload.Size), ip)
+	notifyUpload(name, ev.Upload.Size, sender(ip, ua))
 	select {
 	case kick <- struct{}{}:
 	default:
@@ -661,6 +755,21 @@ func sweepOnce() {
 		}
 		log.Printf("swept stale partial %s", filepath.Base(data))
 	}
+	// Forget sightings of uploads that finished or were swept. Stat outside
+	// the lock: note() takes it on the upload path.
+	seen.Lock()
+	ids := make([]string, 0, len(seen.m))
+	for id := range seen.m {
+		ids = append(ids, id)
+	}
+	seen.Unlock()
+	for _, id := range ids {
+		if !fileExists(filepath.Join(partDir, id+".info")) {
+			seen.Lock()
+			delete(seen.m, id)
+			seen.Unlock()
+		}
+	}
 	// Strays with no .info: a crash between tusd creating the data file and
 	// its .info, or lock/stop files from the old file locker.
 	entries, _ := os.ReadDir(partDir)
@@ -690,9 +799,17 @@ type fileRow struct {
 }
 
 type partRow struct {
-	Name           string
-	Size, Received int64
-	Saving         bool // finished, being copied to the NAS
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Size     int64  `json:"size"`
+	Received int64  `json:"received"`
+	Saving   bool   `json:"saving"` // finished, being copied to the NAS
+	Age      int64  `json:"age"`    // seconds since the upload was created
+	Idle     int64  `json:"idle"`   // seconds since the last byte arrived
+	IP       string `json:"ip,omitempty"`
+	UA       string `json:"ua,omitempty"`
+	Client   string `json:"client,omitempty"` // UA boiled down, e.g. "Safari on macOS"
+	Resumes  int    `json:"resumes"`
 }
 
 func (p partRow) Percent() int {
@@ -744,10 +861,21 @@ func partials() []partRow {
 		if json.Unmarshal(raw, &fi) != nil {
 			continue
 		}
-		row := partRow{Name: fi.MetaData["filename"], Size: fi.Size}
+		row := partRow{ID: fi.ID, Name: fi.MetaData["filename"], Size: fi.Size, IP: cleanIP(fi.MetaData[metaIP]), UA: clip(fi.MetaData[metaUA], 512)}
+		// filestore writes the .info once, at creation.
+		if st, err := os.Stat(p); err == nil {
+			row.Age = int64(time.Since(st.ModTime()).Seconds())
+		}
 		if st, err := os.Stat(strings.TrimSuffix(p, ".info")); err == nil {
 			row.Received = st.Size()
+			row.Idle = int64(time.Since(st.ModTime()).Seconds())
 		}
+		seen.Lock()
+		if s := seen.m[fi.ID]; s != nil {
+			row.IP, row.UA, row.Resumes = s.ip, s.ua, s.resumes
+		}
+		seen.Unlock()
+		row.Client = describeUA(row.UA)
 		rows = append(rows, row)
 	}
 	ids, _ := os.ReadDir(outDir)
@@ -755,11 +883,72 @@ func partials() []partRow {
 		files, _ := os.ReadDir(filepath.Join(outDir, id.Name()))
 		for _, f := range files {
 			if info, err := f.Info(); err == nil {
-				rows = append(rows, partRow{Name: f.Name(), Size: info.Size(), Received: info.Size(), Saving: true})
+				rows = append(rows, partRow{ID: "outbox/" + id.Name() + "/" + f.Name(), Name: f.Name(), Size: info.Size(), Received: info.Size(), Saving: true})
 			}
 		}
 	}
 	return rows
+}
+
+// arriving is the Arriving list as JSON, polled by the admin page.
+func arriving(w http.ResponseWriter, r *http.Request) {
+	rows := partials()
+	if rows == nil {
+		rows = []partRow{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	json.NewEncoder(w).Encode(rows)
+}
+
+// describeUA names the browser and OS in a User-Agent, or returns "".
+func describeUA(ua string) string {
+	has := func(subs ...string) bool {
+		for _, s := range subs {
+			if strings.Contains(ua, s) {
+				return true
+			}
+		}
+		return false
+	}
+	var browser, osName string
+	switch { // order matters: most UAs also claim to be Safari and/or Chrome
+	case has("Edg/", "EdgA/", "EdgiOS/"):
+		browser = "Edge"
+	case has("OPR/", "Opera"):
+		browser = "Opera"
+	case has("Firefox/", "FxiOS/"):
+		browser = "Firefox"
+	case has("Chrome/", "CriOS/"):
+		browser = "Chrome"
+	case has("Safari/"):
+		browser = "Safari"
+	case has("curl/"):
+		browser = "curl"
+	}
+	switch {
+	case has("iPhone"):
+		osName = "iOS"
+	case has("iPad"):
+		osName = "iPadOS"
+	case has("Android"):
+		osName = "Android"
+	case has("Windows"):
+		osName = "Windows"
+	case has("CrOS"):
+		osName = "ChromeOS"
+	case has("Macintosh", "Mac OS X"):
+		osName = "macOS"
+	case has("Linux"):
+		osName = "Linux"
+	}
+	switch {
+	case browser != "" && osName != "":
+		return browser + " on " + osName
+	case browser != "":
+		return browser
+	}
+	return osName
 }
 
 // adminAuth is persisted to authFile. Hash is bcrypt; MustChange forces a
@@ -1109,11 +1298,30 @@ func render(w http.ResponseWriter, name string, data any) {
 	}
 }
 
+// clientIP is the sender's address: the last X-Forwarded-For hop (the one
+// our reverse proxy added; earlier hops are whatever the client claimed),
+// else the peer address. Always an IP literal or "", so it's safe to show
+// and to put in emails.
 func clientIP(h http.Header, remote string) string {
-	if xff := h.Get("X-Forwarded-For"); xff != "" {
-		return xff
+	if xff := h.Values("X-Forwarded-For"); len(xff) > 0 {
+		hops := strings.Split(xff[len(xff)-1], ",")
+		if ip := cleanIP(hops[len(hops)-1]); ip != "" {
+			return ip
+		}
 	}
-	return remote
+	if host, _, err := net.SplitHostPort(remote); err == nil {
+		remote = host
+	}
+	return cleanIP(remote)
+}
+
+// cleanIP returns s as a canonical IP address, or "" if it isn't one.
+func cleanIP(s string) string {
+	ip := net.ParseIP(strings.TrimSpace(s))
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
 }
 
 // pageTitle is the upload page heading for the configured owner name.

@@ -158,12 +158,12 @@ func TestNotifierBatchesUploads(t *testing.T) {
 	old := notifyBatch
 	notifyBatch = 100 * time.Millisecond
 	t.Cleanup(func() { notifyBatch = old })
-	go notifier()
-	notifyUpload("holiday.mp4", 4<<30)
-	notifyUpload("résumé.pdf", 2048)
+	go notifier(startCh, notifyCh)
+	notifyUpload("holiday.mp4", 4<<30, sender("203.0.113.7", safariMac))
+	notifyUpload("résumé.pdf", 2048, "")
 	select {
 	case m := <-msgs:
-		for _, want := range []string{"Subject: 2 new uploads received", "holiday.mp4 (4.0 GB)", "résumé.pdf (2.0 KB)", "https://upload.example.com/admin"} {
+		for _, want := range []string{"Subject: 2 new uploads received", "holiday.mp4 (4.0 GB) from 203.0.113.7, Safari on macOS", "résumé.pdf (2.0 KB)\r\n", "https://upload.example.com/admin"} {
 			if !strings.Contains(m, want) {
 				t.Errorf("email missing %q:\n%s", want, m)
 			}
@@ -180,10 +180,10 @@ func TestNotifierBatchesUploads(t *testing.T) {
 
 func TestNoNotificationWhenUnconfigured(t *testing.T) {
 	testDirs(t)
-	notifyUpload("x", 1)
+	notifyUpload("x", 1, "")
 	select {
 	case l := <-notifyCh:
-		t.Fatalf("queued %q with notifications off", l)
+		t.Fatalf("queued %+v with notifications off", l)
 	default:
 	}
 }
@@ -206,4 +206,104 @@ func TestOwnerNameOnPages(t *testing.T) {
 		t.Fatal("owner missing on share page")
 	}
 	_ = http.StatusOK
+}
+
+const safariMac = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
+
+// creating an upload queues a "started" notice; the email leaves out
+// uploads that finished while the batch collected.
+func TestStartEmailListsOnlyUnfinished(t *testing.T) {
+	testDirs(t)
+	saveSettings(mailSettings("127.0.0.1", 25))
+	mux, _ := newMux()
+	going := filepath.Base(tusCreate(t, mux, 10))
+	done := filepath.Base(tusCreate(t, mux, 10))
+	var batch []notice
+	for range 2 {
+		select {
+		case n := <-startCh:
+			batch = append(batch, n)
+		default:
+			t.Fatal("create didn't queue a start notice")
+		}
+	}
+	if batch[0].id != going || batch[1].id != done {
+		t.Fatalf("notice ids %q %q, want %q %q", batch[0].id, batch[1].id, going, done)
+	}
+	os.Remove(filepath.Join(partDir, done+".info")) // what toOutbox does
+	subject, body := startEmail(currentSettings(), batch)
+	if subject != "Upload started" || strings.Count(body, "f.bin") != 1 {
+		t.Fatalf("subject %q body %q", subject, body)
+	}
+	os.Remove(filepath.Join(partDir, going+".info"))
+	if subject, _ := startEmail(currentSettings(), batch); subject != "" {
+		t.Fatalf("emailed %q with every upload already finished", subject)
+	}
+}
+
+// each email can be turned off on its own, and a settings form without the
+// checkboxes (e.g. a page loaded before they existed) leaves them alone.
+func TestNotifyToggles(t *testing.T) {
+	testDirs(t)
+	mux, _ := newMux()
+	c := adminCookie(t)
+	if s := settingsFromEnv(); s.MuteStart || s.MuteDone {
+		t.Fatal("emails should default to on")
+	}
+	form := url.Values{"smtp_port": {"587"}, "smtp_security": {"starttls"}, "notify_to": {"me@example.com"},
+		"mail_from": {"up@example.com"}, "smtp_host": {"smtp.example.com"}, "notify_flags": {"1"}, "notify_done": {"1"}}
+	postForm(mux, "/admin/settings", form, c)
+	if s := currentSettings(); !s.MuteStart || s.MuteDone {
+		t.Fatalf("after unticking start: %+v", s)
+	}
+	notifyStart("x", "a", 1, "")
+	notifyUpload("a", 1, "")
+	if len(startCh) != 0 || len(notifyCh) != 1 {
+		t.Fatalf("queued start=%d done=%d, want 0 and 1", len(startCh), len(notifyCh))
+	}
+	<-notifyCh
+	form.Del("notify_flags")
+	form.Del("notify_done")
+	postForm(mux, "/admin/settings", form, c)
+	if s := currentSettings(); !s.MuteStart || s.MuteDone {
+		t.Fatalf("form without the checkboxes changed them: %+v", s)
+	}
+	if body := get(t, mux, "/admin/settings", c).Body.String(); !strings.Contains(body, `name="notify_done" value="1" checked`) ||
+		strings.Contains(body, `name="notify_start" value="1" checked`) {
+		t.Fatal("checkboxes don't reflect the saved settings")
+	}
+}
+
+// a "started" email only lists uploads that have been running startBatch,
+// later ones wait for the next email, and emails are at least notifyBatch
+// apart.
+func TestStartEmailsWaitForEachUpload(t *testing.T) {
+	testDirs(t)
+	host, port, msgs := fakeSMTP(t)
+	saveSettings(mailSettings(host, port))
+	oldB, oldS := notifyBatch, startBatch
+	notifyBatch, startBatch = 400*time.Millisecond, 200*time.Millisecond
+	t.Cleanup(func() { notifyBatch, startBatch = oldB, oldS })
+	a, b := newPartial(t, 10, 0), newPartial(t, 10, 0)
+	ch := make(chan notice, 10)
+	go batchMail(ch, 0, func() time.Duration { return startBatch }, startEmail)
+	start := time.Now()
+	ch <- notice{a, "first.bin", time.Now()}
+	time.Sleep(150 * time.Millisecond)
+	ch <- notice{b, "second.bin", time.Now()}
+	m := <-msgs
+	if !strings.Contains(m, "first.bin") || strings.Contains(m, "second.bin") {
+		t.Fatalf("first email: %q", m)
+	}
+	select {
+	case m := <-msgs:
+		if !strings.Contains(m, "second.bin") || strings.Contains(m, "first.bin") {
+			t.Fatalf("second email: %q", m)
+		}
+		if gap := time.Since(start); gap < 600*time.Millisecond {
+			t.Fatalf("second email after %v, want the %v gap respected", gap, notifyBatch)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("held notice never sent")
+	}
 }

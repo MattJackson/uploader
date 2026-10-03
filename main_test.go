@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"html"
 	"io"
@@ -36,6 +37,11 @@ func testDirs(t *testing.T) (data, spool string) {
 	admitted = nil
 	nasFree.at = time.Time{}
 	cfg = settings{}
+	// Fresh queues: a notifier started by an earlier test keeps its own.
+	notifyCh, startCh = make(chan notice, 1000), make(chan notice, 1000)
+	seen.Lock()
+	seen.m = map[string]*sighting{}
+	seen.Unlock()
 	for _, d := range []string{partDir, outDir} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
@@ -787,5 +793,122 @@ func TestCleanNameKeepsJoiners(t *testing.T) {
 	in := "kids \U0001F468‍\U0001F469‍\U0001F467 می‌خواهم.jpg"
 	if got := cleanName(in); got != in {
 		t.Fatalf("cleanName stripped joiners: %q", got)
+	}
+}
+
+// a new upload is stamped with who sent it, server-side, and the client
+// can't forge the stamp.
+func TestCreateStampsSender(t *testing.T) {
+	testDirs(t)
+	mux, _ := newMux()
+	req := httptest.NewRequest("POST", "/files/", nil)
+	req.Header.Set("Tus-Resumable", "1.0.0")
+	req.Header.Set("Upload-Length", "10")
+	req.Header.Set("X-Forwarded-For", "203.0.113.7")
+	req.Header.Set("User-Agent", safariMac)
+	req.Header.Set("Upload-Metadata", "filename "+base64.StdEncoding.EncodeToString([]byte("f.bin"))+
+		",uploader.ip "+base64.StdEncoding.EncodeToString([]byte("1.1.1.1")))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body)
+	}
+	rows := partials()
+	if len(rows) != 1 {
+		t.Fatalf("rows %+v", rows)
+	}
+	if r := rows[0]; r.Name != "f.bin" || r.IP != "203.0.113.7" || r.Client != "Safari on macOS" || !uploadID(r.ID) {
+		t.Fatalf("row %+v", r)
+	}
+}
+
+// the admin's Arriving feed: JSON for the admin only, with resumes counted
+// from HEADs, and requests for made-up ids not remembered.
+func TestArrivingFeed(t *testing.T) {
+	testDirs(t)
+	mux, _ := newMux()
+	c := adminCookie(t)
+	loc := tusCreate(t, mux, 10)
+	if rec := tusPatch(mux, loc, 0, "01234"); rec.Code != http.StatusNoContent {
+		t.Fatalf("PATCH: %d", rec.Code)
+	}
+	for range 2 {
+		req := httptest.NewRequest("HEAD", loc, nil)
+		req.Header.Set("Tus-Resumable", "1.0.0")
+		req.RemoteAddr = "198.51.100.9:4242"
+		mux.ServeHTTP(httptest.NewRecorder(), req)
+	}
+	bogus := httptest.NewRequest("HEAD", "/files/"+strings.Repeat("ab", 16), nil)
+	mux.ServeHTTP(httptest.NewRecorder(), bogus)
+	seen.Lock()
+	n := len(seen.m)
+	seen.Unlock()
+	if n != 1 {
+		t.Fatalf("seen has %d entries, want 1", n)
+	}
+
+	if rec := get(t, mux, "/admin/arriving", nil); rec.Code != http.StatusSeeOther {
+		t.Fatalf("anonymous feed: %d", rec.Code)
+	}
+	rec := get(t, mux, "/admin/arriving", c)
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("content type %q", ct)
+	}
+	var rows []partRow
+	if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil || len(rows) != 1 {
+		t.Fatalf("feed %s: %v", rec.Body, err)
+	}
+	if r := rows[0]; r.Received != 5 || r.Size != 10 || r.Resumes != 2 || r.IP != "198.51.100.9" {
+		t.Fatalf("row %+v", r)
+	}
+
+	os.Remove(filepath.Join(partDir, filepath.Base(loc)+".info"))
+	sweepOnce()
+	seen.Lock()
+	n = len(seen.m)
+	seen.Unlock()
+	if n != 0 {
+		t.Fatal("sweep kept a sighting of a finished upload")
+	}
+	if rec := get(t, mux, "/admin/arriving", c); strings.TrimSpace(rec.Body.String()) != "[]" {
+		t.Fatalf("empty feed: %s", rec.Body)
+	}
+}
+
+func TestDescribeUA(t *testing.T) {
+	for ua, want := range map[string]string{
+		safariMac: "Safari on macOS",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36":                        "Chrome on Windows",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0":          "Edge on Windows",
+		"Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0":                                                                 "Firefox on Linux",
+		"Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/129.0 Mobile/15E148 Safari/604.1": "Chrome on iOS",
+		"Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Mobile Safari/537.36":                               "Chrome on Android",
+		"curl/8.7.1": "curl",
+		"":           "",
+	} {
+		if got := describeUA(ua); got != want {
+			t.Errorf("describeUA(%q) = %q, want %q", ua, got, want)
+		}
+	}
+}
+
+// the sender's address is always a plain IP: forged earlier XFF hops and
+// junk are ignored.
+func TestClientIP(t *testing.T) {
+	for _, c := range []struct{ xff, remote, want string }{
+		{"", "198.51.100.9:4242", "198.51.100.9"},
+		{"203.0.113.7", "10.0.0.2:80", "203.0.113.7"},
+		{"6.6.6.6, 203.0.113.7", "10.0.0.2:80", "203.0.113.7"},
+		{"your storage is full, log in at http://evil", "10.0.0.2:80", "10.0.0.2"},
+		{"", "[2001:db8::1]:443", "2001:db8::1"},
+		{"", "@", ""},
+	} {
+		h := http.Header{}
+		if c.xff != "" {
+			h.Set("X-Forwarded-For", c.xff)
+		}
+		if got := clientIP(h, c.remote); got != c.want {
+			t.Errorf("clientIP(%q, %q) = %q, want %q", c.xff, c.remote, got, c.want)
+		}
 	}
 }

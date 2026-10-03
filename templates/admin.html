@@ -8,14 +8,14 @@
 	<p class="sub">Upload here to get a shareable link, or grab what's been sent to you.</p>
 	<div id="drop"></div>
 
-	{{if .Partials}}
+	<section id="arriving"{{if not .Partials}} hidden{{end}}>
 	<h2>Arriving</h2>
-	<div class="card"><table>
+	<div class="card"><table><tbody>
 	{{range .Partials}}
-		<tr><td class="name">{{.Name}}</td><td class="meta">{{if .Saving}}{{size .Size}} · saving to NAS…{{else}}{{size .Received}} / {{size .Size}}{{end}}</td><td class="actions"><progress max="100" value="{{.Percent}}"></progress></td></tr>
+		<tr data-id="{{.ID}}"><td class="name">{{.Name}}</td><td class="meta">{{if .Saving}}{{size .Size}} · saving to NAS…{{else}}{{size .Received}} / {{size .Size}}{{end}}</td><td class="actions"><progress max="100" value="{{.Percent}}"></progress></td></tr>
 	{{end}}
-	</table></div>
-	{{end}}
+	</tbody></table></div>
+	</section>
 
 	<h2>Received</h2>
 	<div class="card"><table>

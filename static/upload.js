@@ -21,6 +21,10 @@ const uppy = new Uppy({ restrictions: { maxFileSize: 500 * 1024 ** 3 } })
 		removeFingerprintOnSuccess: true,
 	})
 
+// admin.js won't auto-reload while files are staged, uploading or failed:
+// a reload would drop them.
+window.uploading = () => uppy.getFiles().some((f) => !f.progress.uploadComplete)
+
 uppy.on('complete', (result) => {
 	if (!result.successful.length || result.failed.length) return
 	if (admin) {

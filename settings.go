@@ -13,6 +13,7 @@ import (
 	"net/mail"
 	"net/smtp"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,6 +34,9 @@ type settings struct {
 	SMTPSecurity string `json:"smtp_security"` // none | starttls | tls
 	SMTPUser     string `json:"smtp_user"`     // empty = no auth
 	SMTPPass     string `json:"smtp_pass"`     //
+	// Which emails to send; stored inverted so both are on unless turned off.
+	MuteStart bool `json:"mute_start"` // "upload started"
+	MuteDone  bool `json:"mute_done"`  // "upload received"
 }
 
 var securityModes = []string{"starttls", "tls", "none"}
@@ -213,6 +217,12 @@ func settingsFromForm(r *http.Request, old settings) (settings, string) {
 	if r.PostFormValue("clear_pass") != "" {
 		s.SMTPPass = ""
 	}
+	// Only a form that showed the checkboxes may change them: an unticked
+	// box is simply absent, same as a page from before they existed.
+	if r.PostFormValue("notify_flags") != "" {
+		s.MuteStart = r.PostFormValue("notify_start") == ""
+		s.MuteDone = r.PostFormValue("notify_done") == ""
+	}
 	return s, ""
 }
 
@@ -257,59 +267,166 @@ func sendTestEmail(w http.ResponseWriter, r *http.Request) {
 // ── notifications ──
 
 // notifyBatch is how long the notifier collects uploads before sending one
-// email, so a batch of 30 photos is one message, not 30.
-var notifyBatch = 2 * time.Minute
+// email, so a batch of 30 photos is one message, not 30; it is also the
+// least time between two emails of a kind, however busy (or abused) the
+// upload page is. startBatch is how long an upload must have been running
+// to get a "started" email: quicker ones only get "received".
+var (
+	notifyBatch = 2 * time.Minute
+	startBatch  = 30 * time.Second
+)
 
-var notifyCh = make(chan string, 1000)
+// notice is one line of a notification email. id, when set, is the tus
+// upload it's about; at is when it was queued.
+type notice struct {
+	id, line string
+	at       time.Time
+}
 
-func notifyUpload(name string, size int64) {
-	if !currentSettings().notifyEnabled() {
+var (
+	notifyCh = make(chan notice, 1000) // received
+	startCh  = make(chan notice, 1000) // started
+)
+
+func notifyUpload(name string, size int64, from string) {
+	if s := currentSettings(); !s.notifyEnabled() || s.MuteDone {
 		return
 	}
+	queue(notifyCh, notice{line: fmt.Sprintf("%s (%s)%s", name, humanSize(size), from), at: time.Now()})
+}
+
+func notifyStart(id, name string, size int64, from string) {
+	if s := currentSettings(); !s.notifyEnabled() || s.MuteStart {
+		return
+	}
+	queue(startCh, notice{id, fmt.Sprintf("%s (%s)%s", name, humanSize(size), from), time.Now()})
+}
+
+func queue(ch chan notice, n notice) {
 	select {
-	case notifyCh <- fmt.Sprintf("%s (%s)", name, humanSize(size)):
+	case ch <- n:
 	default: // more than 1000 queued: the email would be truncated anyway
 	}
 }
 
-func notifier() {
-	for first := range notifyCh {
-		lines := []string{first}
-		deadline := time.After(notifyBatch)
+// sender describes who sent an upload for an email line: " from <ip>,
+// <browser>", or "" if unknown.
+func sender(ip, ua string) string {
+	parts := []string{}
+	for _, p := range []string{ip, describeUA(ua)} {
+		if p != "" {
+			parts = append(parts, p)
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " from " + strings.Join(parts, ", ")
+}
+
+func notifier(start, done chan notice) {
+	go batchMail(start, 0, func() time.Duration { return startBatch }, startEmail)
+	batchMail(done, notifyBatch, func() time.Duration { return 0 }, uploadEmail)
+}
+
+// batchMail sends one email per batch of notices, collecting for wait after
+// the first. A notice joins an email once it is minAge old; younger ones
+// wait for the next. compose may drop notices and returns an empty subject
+// if there's nothing left to say.
+func batchMail(ch chan notice, wait time.Duration, minAge func() time.Duration, compose func(settings, []notice) (string, string)) {
+	var held []notice
+	var last time.Time // last email sent
+	for {
+		batch := held
+		held = nil
+		until := time.Time{}
+		if len(batch) == 0 {
+			batch = []notice{<-ch}
+			until = time.Now().Add(wait)
+		}
+		if t := batch[0].at.Add(minAge()); t.After(until) {
+			until = t
+		}
+		if t := last.Add(notifyBatch); t.After(until) {
+			until = t
+		}
+		deadline := time.After(time.Until(until))
 	collect:
 		for {
 			select {
-			case l := <-notifyCh:
-				lines = append(lines, l)
+			case n := <-ch:
+				batch = append(batch, n)
 			case <-deadline:
 				break collect
 			}
 		}
+		var ripe []notice
+		for _, n := range batch {
+			if time.Since(n.at) >= minAge() {
+				ripe = append(ripe, n)
+			} else {
+				held = append(held, n)
+			}
+		}
 		s := currentSettings()
-		if !s.notifyEnabled() {
+		if !s.notifyEnabled() || len(ripe) == 0 {
 			continue
 		}
-		subject, body := uploadEmail(s, lines)
+		subject, body := compose(s, ripe)
+		if subject == "" {
+			continue
+		}
+		last = time.Now()
 		if err := sendMail(s, s.NotifyTo, subject, body); err != nil {
 			log.Printf("notify %s: %v", s.NotifyTo, err)
 		}
 	}
 }
 
-func uploadEmail(s settings, lines []string) (subject, body string) {
-	subject = "New upload received"
-	if len(lines) > 1 {
-		subject = fmt.Sprintf("%d new uploads received", len(lines))
+func uploadEmail(s settings, batch []notice) (subject, body string) {
+	if s.MuteDone {
+		return "", ""
 	}
+	subject = "New upload received"
+	if len(batch) > 1 {
+		subject = fmt.Sprintf("%d new uploads received", len(batch))
+	}
+	return subject, emailBody(s, subject, batch)
+}
+
+// startEmail leaves out uploads that already finished while the batch was
+// collecting: the "received" email covers those.
+func startEmail(s settings, batch []notice) (subject, body string) {
+	if s.MuteStart {
+		return "", ""
+	}
+	going := batch[:0:0]
+	for _, n := range batch {
+		if fileExists(filepath.Join(partDir, n.id+".info")) {
+			going = append(going, n)
+		}
+	}
+	switch len(going) {
+	case 0:
+		return "", ""
+	case 1:
+		subject = "Upload started"
+	default:
+		subject = fmt.Sprintf("%d uploads started", len(going))
+	}
+	return subject, emailBody(s, subject, going)
+}
+
+func emailBody(s settings, subject string, batch []notice) string {
 	var b strings.Builder
 	b.WriteString(subject + ":\r\n\r\n")
-	for _, l := range lines {
-		b.WriteString("  " + l + "\r\n")
+	for _, n := range batch {
+		b.WriteString("  " + n.line + "\r\n")
 	}
 	if s.PublicURL != "" {
 		b.WriteString("\r\n" + s.PublicURL + "/admin\r\n")
 	}
-	return subject, b.String()
+	return b.String()
 }
 
 // sendMail delivers one plain-text message. Names in the body come from
