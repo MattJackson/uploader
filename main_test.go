@@ -912,3 +912,106 @@ func TestClientIP(t *testing.T) {
 		}
 	}
 }
+
+// curl -T: one PUT lands the file in the outbox under its cleaned name.
+func TestPutUpload(t *testing.T) {
+	testDirs(t)
+	mux, _ := newMux()
+	for _, body := range []string{"0123456789", ""} {
+		req := httptest.NewRequest("PUT", "/my%20clip.mp4", strings.NewReader(body))
+		req.Header.Set("User-Agent", "curl/8.7.1")
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated || !strings.HasPrefix(rec.Body.String(), "received my clip.mp4") {
+			t.Fatalf("PUT %d bytes: %d %q", len(body), rec.Code, rec.Body)
+		}
+	}
+	got, _ := filepath.Glob(filepath.Join(outDir, "*", "my clip.mp4"))
+	if len(got) != 2 {
+		t.Fatalf("outbox has %v", got)
+	}
+	sizes := map[int]bool{}
+	for _, p := range got {
+		b, _ := os.ReadFile(p)
+		sizes[len(b)] = true
+	}
+	if !sizes[10] || !sizes[0] {
+		t.Fatalf("outbox sizes %v", sizes)
+	}
+	if left, _ := filepath.Glob(filepath.Join(partDir, "*")); len(left) != 0 {
+		t.Fatalf("tus records left: %v", left)
+	}
+}
+
+// a pipe has no Content-Length, and tus needs the size up front.
+func TestPutWithoutLengthRefused(t *testing.T) {
+	testDirs(t)
+	mux, _ := newMux()
+	req := httptest.NewRequest("PUT", "/f.bin", strings.NewReader("data"))
+	req.ContentLength = -1
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusLengthRequired {
+		t.Fatalf("status %d", rec.Code)
+	}
+	if rows := partials(); len(rows) != 0 {
+		t.Fatalf("partials: %+v", rows)
+	}
+}
+
+// a PUT cut short can't be resumed, so its partial is removed.
+func TestPutCutShortLeavesNothing(t *testing.T) {
+	testDirs(t)
+	mux, _ := newMux()
+	req := httptest.NewRequest("PUT", "/f.bin", strings.NewReader("01234"))
+	req.ContentLength = 10
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code < 400 {
+		t.Fatalf("status %d %q", rec.Code, rec.Body)
+	}
+	if left, _ := os.ReadDir(partDir); len(left) != 0 {
+		t.Fatalf("partDir: %v", left)
+	}
+	if got, _ := filepath.Glob(filepath.Join(outDir, "*", "*")); len(got) != 0 {
+		t.Fatalf("outbox: %v", got)
+	}
+}
+
+// PUT is refused like any upload when it won't fit, with tus's message.
+func TestPutRefusedWhenNoSpace(t *testing.T) {
+	testDirs(t)
+	reserve = 100
+	mux, _ := newMux()
+	fakeFree(t, 105, 1<<40)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest("PUT", "/f.bin", strings.NewReader("0123456789")))
+	if rec.Code != http.StatusInsufficientStorage || !strings.Contains(rec.Body.String(), "not enough space") {
+		t.Fatalf("%d %q", rec.Code, rec.Body)
+	}
+}
+
+// the bare /files path still takes tus creates.
+func TestBareFilesPathCreates(t *testing.T) {
+	testDirs(t)
+	mux, _ := newMux()
+	req := httptest.NewRequest("POST", "/files", nil)
+	req.Header.Set("Tus-Resumable", "1.0.0")
+	req.Header.Set("Upload-Length", "10")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /files: %d %q", rec.Code, rec.Body)
+	}
+}
+
+// the main page shows the curl command with the configured address.
+func TestIndexShowsCurlCommand(t *testing.T) {
+	testDirs(t)
+	cfg.PublicURL = "https://upload.example.com"
+	mux, _ := newMux()
+	rec := get(t, mux, "/", nil)
+	if !strings.Contains(rec.Body.String(), "curl -T yourfile https://upload.example.com/") {
+		t.Fatalf("index: %s", rec.Body)
+	}
+}

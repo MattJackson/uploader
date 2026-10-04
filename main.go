@@ -3,6 +3,7 @@
 //
 //	/                anyone: pick files, upload (resumable tus via Uppy)
 //	/files/          tus endpoint: create + resume only (no download, no delete)
+//	PUT /<name>      one-shot upload for curl -T (not resumable)
 //	/admin           password login → upload, list, download, delete, copy link
 //	                 (password starts as "password" and must be changed on first
 //	                 login; bcrypt hash in SPOOL_DIR/admin.json — delete that
@@ -20,6 +21,7 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -160,9 +162,10 @@ func main() {
 }
 
 func newMux() (*http.ServeMux, error) {
+	comp := newComposer()
 	tus, err := handler.NewHandler(handler.Config{
 		BasePath:                  "/files/",
-		StoreComposer:             newComposer(),
+		StoreComposer:             comp,
 		MaxSize:                   maxSize,
 		RespectForwardedHeaders:   true,
 		DisableDownload:           true,
@@ -175,12 +178,18 @@ func newMux() (*http.ServeMux, error) {
 		return nil, err
 	}
 
+	files := guardSpool(http.StripPrefix("/files/", watch(tus)))
 	mux := http.NewServeMux()
-	mux.Handle("/files/", guardSpool(http.StripPrefix("/files/", watch(tus))))
-	mux.Handle("/files", guardSpool(http.StripPrefix("/files", watch(tus))))
+	mux.Handle("/files/", files)
+	// Only the methods tus uses on the bare path: a method-less "/files"
+	// would conflict with "PUT /{name}".
+	bare := guardSpool(http.StripPrefix("/files", watch(tus)))
+	mux.Handle("POST /files", bare)
+	mux.Handle("OPTIONS /files", bare)
+	mux.HandleFunc("PUT /{name}", putUpload(files, comp))
 	mux.Handle("GET /static/", http.FileServerFS(staticFS))
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
-		render(w, "index.html", map[string]any{"Owner": currentSettings().OwnerName})
+		render(w, "index.html", map[string]any{"Owner": currentSettings().OwnerName, "Site": siteURL(r)})
 	})
 	mux.HandleFunc("GET /admin", adminPage)
 	mux.HandleFunc("POST /admin/login", sameOrigin(login))
@@ -472,6 +481,144 @@ func finish(ev handler.HookEvent) (handler.HTTPResponse, error) {
 	default:
 	}
 	return handler.HTTPResponse{}, nil
+}
+
+// putUpload is a one-shot upload for `curl -T file https://host/`: curl
+// appends the filename and sends Content-Length. It runs as a tus create
+// plus one PATCH through the same chain as /files/, so space checks,
+// notifications, the Arriving list and the outbox all behave the same.
+// Nothing can resume it, so a partial left by a failed PUT is removed.
+func putUpload(files http.Handler, comp *handler.StoreComposer) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		name := r.PathValue("name")
+		size := r.ContentLength
+		if size < 0 {
+			http.Error(w, "Content-Length required: use curl -T <file>, not a pipe", http.StatusLengthRequired)
+			return
+		}
+
+		create := tusRequest(r, http.MethodPost, "/files/", http.NoBody)
+		create.Header.Set("Upload-Length", strconv.FormatInt(size, 10))
+		create.Header.Set("Upload-Metadata", "filename "+base64.StdEncoding.EncodeToString([]byte(name)))
+		res := &captured{w: w, h: http.Header{}}
+		files.ServeHTTP(res, create)
+		if res.code != http.StatusCreated {
+			res.relay(w)
+			return
+		}
+		loc, _ := url.Parse(res.h.Get("Location"))
+		id := ""
+		if loc != nil {
+			id = filepath.Base(loc.Path)
+		}
+		if !uploadID(id) {
+			log.Printf("put %q: unexpected Location %q", name, res.h.Get("Location"))
+			http.Error(w, "upload failed", http.StatusInternalServerError)
+			return
+		}
+
+		if size > 0 {
+			patch := tusRequest(r, http.MethodPatch, "/files/"+id, r.Body)
+			patch.ContentLength = size
+			patch.Header.Set("Upload-Offset", "0")
+			patch.Header.Set("Content-Type", "application/offset+octet-stream")
+			res = &captured{w: w, h: http.Header{}}
+			files.ServeHTTP(res, patch)
+			if res.code != http.StatusNoContent || res.h.Get("Upload-Offset") != strconv.FormatInt(size, 10) {
+				dropPartial(comp, id)
+				res.relay(w)
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusCreated)
+		fmt.Fprintf(w, "received %s (%s)\n", cleanName(name), humanSize(size))
+	}
+}
+
+// tusRequest derives a tus request from r, keeping what identifies the
+// sender (address, User-Agent, forwarding headers) and nothing that tus
+// would read as protocol.
+func tusRequest(r *http.Request, method, path string, body io.ReadCloser) *http.Request {
+	t := r.Clone(r.Context())
+	t.Method, t.Body, t.ContentLength = method, body, 0
+	t.URL.Path, t.URL.RawPath, t.URL.RawQuery, t.RequestURI = path, "", "", path
+	for k := range t.Header {
+		if lk := strings.ToLower(k); strings.HasPrefix(lk, "upload-") || strings.HasPrefix(lk, "content-") ||
+			lk == "x-http-method-override" || lk == "expect" || lk == "tus-resumable" {
+			t.Header.Del(k)
+		}
+	}
+	t.Header.Set("Tus-Resumable", "1.0.0")
+	return t
+}
+
+// dropPartial removes an unfinished upload. A complete one is left for
+// recoverStranded.
+func dropPartial(comp *handler.StoreComposer, id string) {
+	ctx := context.Background()
+	up, err := comp.Core.GetUpload(ctx, id)
+	if err != nil {
+		return
+	}
+	if info, err := up.GetInfo(ctx); err != nil || info.Offset >= info.Size {
+		return
+	}
+	if err := comp.Terminater.AsTerminatableUpload(up).Terminate(ctx); err != nil {
+		log.Printf("put: removing partial %s: %v", id, err)
+	}
+}
+
+// captured holds a tus response so PUT can answer in its own words. It
+// unwraps to the real writer so tusd's read/write deadlines still reach
+// the connection.
+type captured struct {
+	w    http.ResponseWriter
+	h    http.Header
+	code int
+	body strings.Builder
+}
+
+func (c *captured) Header() http.Header         { return c.h }
+func (c *captured) Unwrap() http.ResponseWriter { return c.w }
+
+func (c *captured) WriteHeader(code int) {
+	if c.code == 0 {
+		c.code = code
+	}
+}
+
+func (c *captured) Write(p []byte) (int, error) {
+	c.WriteHeader(http.StatusOK)
+	if room := 1024 - c.body.Len(); room > 0 {
+		c.body.Write(p[:min(len(p), room)])
+	}
+	return len(p), nil
+}
+
+// relay sends a failed tus response on as plain text.
+func (c *captured) relay(w http.ResponseWriter) {
+	code, msg := c.code, strings.TrimSpace(c.body.String())
+	if code < 400 {
+		code = http.StatusInternalServerError
+	}
+	if msg == "" {
+		msg = "upload failed"
+	}
+	http.Error(w, msg, code)
+}
+
+// siteURL is the address people should upload to: the configured one, or
+// else the one this request came in on.
+func siteURL(r *http.Request) string {
+	if u := currentSettings().PublicURL; u != "" {
+		return u
+	}
+	scheme := "http"
+	if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host
 }
 
 // toOutbox moves a complete upload's data file into outbox/<id>/<name> and

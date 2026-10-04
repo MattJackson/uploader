@@ -18,6 +18,8 @@ h1 { font-size: 30px; font-weight: 700; letter-spacing: -0.02em; margin: 0 0 6px
 h2 { font-size: 18px; font-weight: 600; margin: 40px 0 12px; }
 .sub { color: var(--muted); margin: 0 0 28px; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 28px; }
+.cli { color: var(--muted); font-size: 0.9em; margin-top: 20px; }
+.cli code { user-select: all; }
 .done { margin-top: 20px; padding: 14px 18px; border-radius: 12px; background: color-mix(in srgb, var(--ok) 12%, transparent); color: var(--ok); font-weight: 600; }
 .err { color: var(--danger); margin: 0 0 12px; }
 .top { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
