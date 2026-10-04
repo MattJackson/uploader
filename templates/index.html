@@ -4,7 +4,7 @@
 	<h1>{{title .Owner}}</h1>
 	<p class="sub">Drop your files below or click <b>browse files</b>, then press <b>Upload</b>. Big files are fine. If the connection drops, add the same file again and it carries on where it stopped.</p>
 	<div id="drop"></div>
-	<p class="cli">From a terminal: <code>curl --progress-bar -T yourfile {{.Site}}/ | more</code></p>
+	<p class="cli">From a terminal: <code>{{if .Stream}}curl -T yourfile {{.Site}}/{{else}}curl --progress-bar -T yourfile {{.Site}}/ | more{{end}}</code></p>
 	<p id="done" class="done" hidden>✓ All done{{with .Owner}}, {{.}} has your files{{else}}, your files were delivered{{end}}. You can close this page.</p>
 </main>
 <script type="module" src="/static/upload.js"></script>

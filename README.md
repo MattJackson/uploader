@@ -5,9 +5,9 @@ A small self-hosted drop box. Send someone a link: they pick files and press Upl
 Built for the "my parents need to send me 40 GB of home videos" problem.
 
 - **Any size, resumable.** Uploads are chunked ([tus](https://tus.io)). If the connection drops, adding the same file again continues where it stopped.
-- **One-line uploads from a terminal:** `curl --progress-bar -T video.mp4 https://upload.example.com/ | more`. This isn't resumable, so for very large files the browser page is the better choice.
+- **One-line uploads from a terminal:** `curl -T video.mp4 https://upload.example.com/`, with live progress if the proxy allows it (see below). This isn't resumable, so for very large files the browser page is the better choice.
 - **Upload-only for visitors.** Anonymous users can create and resume uploads. They can't list, read or delete anything.
-- **Admin page** at `/admin`: upload, list, download, delete, and copy share links. Uploads in progress update live, with speed, time left, the sender's IP and browser, when they started, how often they resumed, and a warning when one stalls.
+- **Admin page** at `/admin`: upload, list, download, delete, and copy share links. Uploads in progress update live, with speed, time left, the sender's IP and browser, when they started, and how often they resumed. A stalled upload shows whether the sender is still connected, and an unfinished one can be deleted, which also cuts off a sender who is still connected.
 - **Share links** go to a small landing page with a Download button, so chat-app previews don't pull the whole file. A link is tied to the exact file: deleting, replacing or editing the file revokes it.
 - **Email notifications** (optional) when an upload starts and when it's received, each switchable in Settings. Uploads close together are sent as one email; a "started" email is skipped for uploads that finish within 30 seconds.
 - **Disk safety.** New uploads are refused if they would cut into a free-space reserve, counting space already promised to unfinished uploads. Writes also stop if the local disk runs low.
@@ -29,6 +29,29 @@ upload.example.com {
 	reverse_proxy uploader:8080
 }
 ```
+
+### Live progress for `curl -T`
+
+curl shows no progress bar for uploads while the reply goes to the terminal, so the server can stream its own: `40%  2.1 GB of 5.1 GB  5.4 MB/s  ~9m left`, updated once a second. That means replying while the file is still arriving, which every proxy in between has to allow. The app only does it when the proxy says it can, with an `X-Stream-Progress` header. Without that header, curl gets a single line at the end, and the main page suggests `--progress-bar … | more` instead.
+
+With Caddy:
+
+```caddy
+{
+	servers {
+		enable_full_duplex # needed for HTTP/1.1 clients; HTTP/2 always works
+	}
+}
+
+upload.example.com {
+	reverse_proxy uploader:8080 {
+		header_up X-Stream-Progress 1
+		flush_interval -1
+	}
+}
+```
+
+`enable_full_duplex` is a global option. It only changes anything for backends that reply before reading the whole request body.
 
 Then open `https://upload.example.com/admin` and sign in with **`password`**. You'll be made to choose a new password before anything else works. After that, fill in **Settings** (your name, site URL, mail server) and send the main page's URL to whoever needs to send you files.
 

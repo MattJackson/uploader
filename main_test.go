@@ -1014,4 +1014,124 @@ func TestIndexShowsCurlCommand(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "curl --progress-bar -T yourfile https://upload.example.com/ | more") {
 		t.Fatalf("index: %s", rec.Body)
 	}
+	// Behind a proxy that streams, plain curl -T shows our progress.
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Set("X-Stream-Progress", "1")
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if b := rec.Body.String(); !strings.Contains(b, "<code>curl -T yourfile https://upload.example.com/</code>") {
+		t.Fatalf("index with streaming: %s", b)
+	}
+}
+
+// with the proxy's go-ahead, a PUT streams progress lines while the body
+// arrives, over a real connection (100 Continue, full duplex).
+func TestPutStreamsProgress(t *testing.T) {
+	testDirs(t)
+	mux, _ := newMux()
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	pr, pw := io.Pipe()
+	req, _ := http.NewRequest("PUT", srv.URL+"/f.bin", pr)
+	req.ContentLength = 20
+	req.Header.Set("X-Stream-Progress", "1")
+	type result struct {
+		resp *http.Response
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := http.DefaultClient.Do(req)
+		done <- result{resp, err}
+	}()
+	pw.Write([]byte("0123456789"))
+	// The response starts while half the body is still to come.
+	var res result
+	select {
+	case res = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no response while the body was still arriving")
+	}
+	if res.err != nil || res.resp.StatusCode != http.StatusOK {
+		t.Fatalf("resp %v %v", res.resp, res.err)
+	}
+	first := make([]byte, 64)
+	n, _ := res.resp.Body.Read(first)
+	if !strings.Contains(string(first[:n]), "of 20 B") {
+		t.Fatalf("first progress %q", first[:n])
+	}
+	pw.Write([]byte("abcdefghij"))
+	pw.Close()
+	rest, _ := io.ReadAll(res.resp.Body)
+	if !strings.Contains(string(rest), "100%") || !strings.HasSuffix(string(rest), "received f.bin (20 B)\n") {
+		t.Fatalf("rest %q", rest)
+	}
+	if got, _ := filepath.Glob(filepath.Join(outDir, "*", "f.bin")); len(got) != 1 {
+		t.Fatalf("outbox %v", got)
+	}
+}
+
+// Arriving says whether the sender is still connected, and an admin can
+// delete an unfinished upload, cutting off a sender who still is.
+func TestDeletePartialStopsSender(t *testing.T) {
+	testDirs(t)
+	mux, _ := newMux()
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	loc := tusCreate(t, mux, 100)
+	id := filepath.Base(loc)
+	pr, pw := io.Pipe()
+	req, _ := http.NewRequest("PATCH", srv.URL+loc, pr)
+	req.Header.Set("Tus-Resumable", "1.0.0")
+	req.Header.Set("Upload-Offset", "0")
+	req.Header.Set("Content-Type", "application/offset+octet-stream")
+	done := make(chan struct{})
+	go func() {
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			resp.Body.Close()
+		}
+		close(done)
+	}()
+	pw.Write([]byte("0123456789")) // then go quiet, connection open
+	connected := func() bool {
+		for _, r := range partials() {
+			if r.ID == id {
+				return r.Connected
+			}
+		}
+		return false
+	}
+	for i := 0; !connected(); i++ {
+		if i == 200 {
+			t.Fatal("never shown as connected")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	rec := postForm(mux, "/admin/partial/delete", url.Values{"id": {id}}, adminCookie(t))
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("delete: %d", rec.Code)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sender still connected after delete")
+	}
+	pw.Close()
+	if left, _ := os.ReadDir(partDir); len(left) != 0 {
+		t.Fatalf("partDir: %v", left)
+	}
+	if rows := partials(); len(rows) != 0 {
+		t.Fatalf("rows: %+v", rows)
+	}
+}
+
+// deleting needs the admin.
+func TestDeletePartialNeedsAdmin(t *testing.T) {
+	testDirs(t)
+	mux, _ := newMux()
+	id := filepath.Base(tusCreate(t, mux, 10))
+	postForm(mux, "/admin/partial/delete", url.Values{"id": {id}}, nil)
+	if !fileExists(filepath.Join(partDir, id+".info")) {
+		t.Fatal("anonymous delete removed the upload")
+	}
 }

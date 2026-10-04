@@ -40,10 +40,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -189,7 +191,7 @@ func newMux() (*http.ServeMux, error) {
 	mux.HandleFunc("PUT /{name}", putUpload(files, comp))
 	mux.Handle("GET /static/", http.FileServerFS(staticFS))
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
-		render(w, "index.html", map[string]any{"Owner": currentSettings().OwnerName, "Site": siteURL(r)})
+		render(w, "index.html", map[string]any{"Owner": currentSettings().OwnerName, "Site": siteURL(r), "Stream": streamOK(r)})
 	})
 	mux.HandleFunc("GET /admin", adminPage)
 	mux.HandleFunc("POST /admin/login", sameOrigin(login))
@@ -199,6 +201,7 @@ func newMux() (*http.ServeMux, error) {
 	mux.HandleFunc("GET /admin/arriving", authed(arriving))
 	mux.HandleFunc("GET /admin/dl/{name}", authed(adminDownload))
 	mux.HandleFunc("POST /admin/delete", sameOrigin(authed(deleteFile)))
+	mux.HandleFunc("POST /admin/partial/delete", sameOrigin(authed(deletePartial(comp))))
 	mux.HandleFunc("GET /admin/settings", authed(settingsPage))
 	mux.HandleFunc("POST /admin/settings", sameOrigin(authed(saveSettingsForm)))
 	mux.HandleFunc("POST /admin/settings/test", sameOrigin(authed(sendTestEmail)))
@@ -309,6 +312,33 @@ var seen = struct {
 type sighting struct {
 	ip, ua  string
 	resumes int
+	active  int    // PATCHes in flight: the sender is connected
+	cuts    []*cut // one per PATCH in flight, for stopAndRemove
+}
+
+// cut stops a PATCH in flight: the flag fails its next read, and a read
+// deadline of now ends one that is waiting on the network.
+type cut struct {
+	rc   *http.ResponseController
+	done atomic.Bool
+}
+
+var errCut = errors.New("upload deleted on the server")
+
+type cutBody struct {
+	io.ReadCloser
+	c *cut
+}
+
+func (b cutBody) Read(p []byte) (int, error) {
+	if b.c.done.Load() {
+		return 0, errCut
+	}
+	n, err := b.ReadCloser.Read(p)
+	if b.c.done.Load() {
+		return n, errCut
+	}
+	return n, err
 }
 
 // watch records sightings for the admin list. It only reads the request and
@@ -316,16 +346,29 @@ type sighting struct {
 func watch(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead || r.Method == http.MethodPatch {
-			note(strings.Trim(r.URL.Path, "/"), r)
+			if s := note(strings.Trim(r.URL.Path, "/"), r); s != nil && r.Method == http.MethodPatch {
+				c := &cut{rc: http.NewResponseController(w)}
+				r.Body = cutBody{r.Body, c}
+				seen.Lock()
+				s.active++
+				s.cuts = append(s.cuts, c)
+				seen.Unlock()
+				defer func() {
+					seen.Lock()
+					s.active--
+					s.cuts = slices.DeleteFunc(s.cuts, func(x *cut) bool { return x == c })
+					seen.Unlock()
+				}()
+			}
 		}
 		h.ServeHTTP(w, r)
 	})
 }
 
-func note(id string, r *http.Request) {
+func note(id string, r *http.Request) *sighting {
 	// Only real uploads: the map can't be grown by requests for made-up ids.
 	if !uploadID(id) || !fileExists(filepath.Join(partDir, id+".info")) {
-		return
+		return nil
 	}
 	seen.Lock()
 	defer seen.Unlock()
@@ -339,6 +382,7 @@ func note(id string, r *http.Request) {
 	if r.Method == http.MethodHead {
 		s.resumes++
 	}
+	return s
 }
 
 // uploadID matches the ids filestore hands out: 32 hex digits.
@@ -488,6 +532,9 @@ func finish(ev handler.HookEvent) (handler.HTTPResponse, error) {
 // plus one PATCH through the same chain as /files/, so space checks,
 // notifications, the Arriving list and the outbox all behave the same.
 // Nothing can resume it, so a partial left by a failed PUT is removed.
+//
+// When the proxy says it can carry it (streamOK), progress is streamed
+// back while the file arrives; curl prints it as it comes.
 func putUpload(files http.Handler, comp *handler.StoreComposer) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
@@ -517,22 +564,119 @@ func putUpload(files http.Handler, comp *handler.StoreComposer) http.HandlerFunc
 			return
 		}
 
+		var prog *progress
 		if size > 0 {
-			patch := tusRequest(r, http.MethodPatch, "/files/"+id, r.Body)
+			body := r.Body
+			if streamOK(r) {
+				rc := http.NewResponseController(w)
+				rc.EnableFullDuplex() // HTTP/1.1 only; HTTP/2 always is
+				prog = &progress{ReadCloser: r.Body, w: w, rc: rc, size: size}
+				body = prog
+			}
+			patch := tusRequest(r, http.MethodPatch, "/files/"+id, body)
 			patch.ContentLength = size
 			patch.Header.Set("Upload-Offset", "0")
 			patch.Header.Set("Content-Type", "application/offset+octet-stream")
 			res = &captured{w: w, h: http.Header{}}
 			files.ServeHTTP(res, patch)
 			if res.code != http.StatusNoContent || res.h.Get("Upload-Offset") != strconv.FormatInt(size, 10) {
+				gone := !fileExists(filepath.Join(partDir, id+".info"))
 				dropPartial(comp, id)
-				res.relay(w)
+				if prog == nil || !prog.started {
+					res.relay(w)
+					return
+				}
+				msg := strings.TrimSpace(res.body.String())
+				if gone {
+					msg = "cancelled on the server"
+				} else if msg == "" {
+					msg = "connection lost"
+				}
+				fmt.Fprintf(w, "\nupload failed after %s: %s\n", humanSize(prog.n), msg)
 				return
 			}
+		}
+		if prog != nil && prog.started {
+			prog.n = size
+			prog.line(time.Now())
+			fmt.Fprintf(w, "\nreceived %s (%s)\n", cleanName(name), humanSize(size))
+			return
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusCreated)
 		fmt.Fprintf(w, "received %s (%s)\n", cleanName(name), humanSize(size))
+	}
+}
+
+// streamOK reports whether the proxy in front of us passes a response
+// through while the request body is still arriving. The operator says so
+// with a header (see the README); without it we answer once, at the end,
+// because answering early through a proxy that can't do it breaks the
+// upload.
+func streamOK(r *http.Request) bool {
+	return r.Header.Get("X-Stream-Progress") != ""
+}
+
+// progress passes the upload body through and, about once a second,
+// rewrites a status line on the sender's terminal. Reads happen on the
+// handler's goroutine (tusd copies the body synchronously), so writing to
+// w here doesn't race with anything. The 200 goes out after the first
+// read: that read is what sends curl its 100 Continue.
+type progress struct {
+	io.ReadCloser
+	w       http.ResponseWriter
+	rc      *http.ResponseController
+	size, n int64
+	started bool
+	last    time.Time
+	marks   []mark // recent (time, bytes) samples, for the speed
+}
+
+type mark struct {
+	t time.Time
+	n int64
+}
+
+func (p *progress) Read(b []byte) (int, error) {
+	k, err := p.ReadCloser.Read(b)
+	p.n += int64(k)
+	if now := time.Now(); !p.started {
+		p.started = true
+		p.w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		p.w.WriteHeader(http.StatusOK)
+		p.line(now)
+	} else if now.Sub(p.last) >= time.Second {
+		p.line(now)
+	}
+	return k, err
+}
+
+func (p *progress) line(now time.Time) {
+	p.last = now
+	p.marks = append(p.marks, mark{now, p.n})
+	for len(p.marks) > 2 && now.Sub(p.marks[1].t) >= 10*time.Second {
+		p.marks = p.marks[1:]
+	}
+	s := fmt.Sprintf("%3d%%  %s of %s", p.n*100/max(p.size, 1), humanSize(p.n), humanSize(p.size))
+	if first := p.marks[0]; p.n < p.size && now.Sub(first.t) >= time.Second && p.n > first.n {
+		bps := float64(p.n-first.n) / now.Sub(first.t).Seconds()
+		left := time.Duration(float64(p.size-p.n) / bps * float64(time.Second))
+		s += fmt.Sprintf("  %s/s  ~%s left", humanSize(int64(bps)), shortDur(left))
+	}
+	// \r and padding: each line overwrites the last one on a terminal.
+	fmt.Fprintf(p.w, "\r%-50s", s)
+	p.rc.Flush()
+}
+
+func shortDur(d time.Duration) string {
+	s := int64(d.Round(time.Second).Seconds())
+	switch {
+	case s < 60:
+		return fmt.Sprintf("%ds", s)
+	case s < 3600:
+		return fmt.Sprintf("%dm %ds", s/60, s%60)
+	default:
+		return fmt.Sprintf("%dh %dm", s/3600, s%3600/60)
 	}
 }
 
@@ -957,6 +1101,9 @@ type partRow struct {
 	UA       string `json:"ua,omitempty"`
 	Client   string `json:"client,omitempty"` // UA boiled down, e.g. "Safari on macOS"
 	Resumes  int    `json:"resumes"`
+	// A request is open for it right now. Idle and not connected means the
+	// sender has gone and the upload waits for them to resume.
+	Connected bool `json:"connected"`
 }
 
 func (p partRow) Percent() int {
@@ -1019,7 +1166,7 @@ func partials() []partRow {
 		}
 		seen.Lock()
 		if s := seen.m[fi.ID]; s != nil {
-			row.IP, row.UA, row.Resumes = s.ip, s.ua, s.resumes
+			row.IP, row.UA, row.Resumes, row.Connected = s.ip, s.ua, s.resumes, s.active > 0
 		}
 		seen.Unlock()
 		row.Client = describeUA(row.UA)
@@ -1353,6 +1500,69 @@ func deleteFile(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	http.Redirect(w, r, "/admin", http.StatusSeeOther)
+}
+
+// deletePartial removes an unfinished upload, cutting off its sender if
+// they are still connected.
+func deletePartial(comp *handler.StoreComposer) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !parseSmallForm(w, r) {
+			return
+		}
+		if id := r.PostFormValue("id"); uploadID(id) && fileExists(filepath.Join(partDir, id+".info")) {
+			if name, err := stopAndRemove(comp, id); err != nil {
+				log.Printf("delete partial %s: %v", id, err)
+			} else {
+				log.Printf("deleted unfinished %q (%s)", name, id)
+			}
+		}
+		http.Redirect(w, r, "/admin", http.StatusSeeOther)
+	}
+}
+
+// stopAndRemove ends any request still writing to an upload, then deletes
+// it. Requests are cut here rather than by asking tusd's lock holder to let
+// go: tusd's release path races with its own body reader.
+func stopAndRemove(comp *handler.StoreComposer, id string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	connected := func() bool {
+		seen.Lock()
+		defer seen.Unlock()
+		s := seen.m[id]
+		if s == nil {
+			return false
+		}
+		for _, c := range s.cuts {
+			c.done.Store(true)
+			c.rc.SetReadDeadline(time.Now())
+		}
+		return s.active > 0
+	}
+	for connected() {
+		select {
+		case <-ctx.Done():
+			return "", errors.New("sender still connected")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	lock, err := comp.Locker.NewLock(id)
+	if err != nil {
+		return "", err
+	}
+	if err := lock.Lock(ctx, func() {}); err != nil {
+		return "", err
+	}
+	defer lock.Unlock()
+	up, err := comp.Core.GetUpload(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	info, err := up.GetInfo(ctx)
+	if err != nil {
+		return "", err
+	}
+	return info.MetaData["filename"], comp.Terminater.AsTerminatableUpload(up).Terminate(ctx)
 }
 
 // ── share links ──

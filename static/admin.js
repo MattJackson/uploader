@@ -69,7 +69,10 @@ if (arriving) {
 			const parts = []
 			const bps = speed(p, now)
 			if (p.idle >= STALL) {
-				parts.push(el('span', 'stalled', 'stalled · no data for ' + dur(p.idle)))
+				// Connected: the sender is there but nothing is moving. Not
+				// connected: they've gone, and it waits for them to resume.
+				const what = p.connected ? 'stalled · connected, no data for ' : 'disconnected · no data for '
+				parts.push(el('span', 'stalled', what + dur(p.idle)))
 			} else if (bps) {
 				parts.push(size(Math.round(bps)) + '/s')
 				parts.push('~' + dur((p.size - p.received) / bps) + ' left')
@@ -93,6 +96,20 @@ if (arriving) {
 			}
 		}
 		const act = el('td', 'actions')
+		if (!p.saving) {
+			const f = el('form')
+			f.method = 'post'
+			f.action = '/admin/partial/delete'
+			const id = el('input')
+			id.type = 'hidden'
+			id.name = 'id'
+			id.value = p.id
+			f.append(id, el('button', 'danger', 'Delete'))
+			const msg = 'Delete the unfinished upload ' + (p.name || '(unnamed)') + '?' +
+				(p.connected ? ' It is still being sent: this stops it.' : '')
+			f.addEventListener('submit', (e) => { if (!confirm(msg)) e.preventDefault() })
+			act.append(f)
+		}
 		act.append(bar)
 		tr.append(name, meta, act)
 		return tr
