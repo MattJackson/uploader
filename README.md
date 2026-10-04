@@ -5,7 +5,7 @@ A small self-hosted drop box. Send someone a link: they pick files and press Upl
 Built for the "my parents need to send me 40 GB of home videos" problem.
 
 - **Any size, resumable.** Uploads are chunked ([tus](https://tus.io)). If the connection drops, adding the same file again continues where it stopped.
-- **One-line uploads from a terminal:** `curl -T video.mp4 https://upload.example.com/`. This isn't resumable, so for very large files the browser page is the better choice.
+- **One-line uploads from a terminal:** `curl --progress-bar -T video.mp4 https://upload.example.com/ | more`. This isn't resumable, so for very large files the browser page is the better choice.
 - **Upload-only for visitors.** Anonymous users can create and resume uploads. They can't list, read or delete anything.
 - **Admin page** at `/admin`: upload, list, download, delete, and copy share links. Uploads in progress update live, with speed, time left, the sender's IP and browser, when they started, how often they resumed, and a warning when one stalls.
 - **Share links** go to a small landing page with a Download button, so chat-app previews don't pull the whole file. A link is tied to the exact file: deleting, replacing or editing the file revokes it.

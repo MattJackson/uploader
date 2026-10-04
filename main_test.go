@@ -1011,7 +1011,7 @@ func TestIndexShowsCurlCommand(t *testing.T) {
 	cfg.PublicURL = "https://upload.example.com"
 	mux, _ := newMux()
 	rec := get(t, mux, "/", nil)
-	if !strings.Contains(rec.Body.String(), "curl -T yourfile https://upload.example.com/") {
+	if !strings.Contains(rec.Body.String(), "curl --progress-bar -T yourfile https://upload.example.com/ | more") {
 		t.Fatalf("index: %s", rec.Body)
 	}
 }
